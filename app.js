@@ -381,11 +381,13 @@ function updateTxUi() {
   $("tx-device").disabled = tx.running;
 }
 
-async function decodeAudio(file) {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new Ctx({ sampleRate: 16000 });
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+
+// 方式1: 16kHzのコンテキストでデコード(デコード時に変換されるため省メモリ)
+async function decodeAt16k(raw) {
+  const ctx = new AudioCtx({ sampleRate: 16000 });
   try {
-    const buf = await ctx.decodeAudioData(await file.arrayBuffer());
+    const buf = await ctx.decodeAudioData(raw);
     const out = new Float32Array(buf.length);
     for (let c = 0; c < buf.numberOfChannels; c++) {
       const d = buf.getChannelData(c);
@@ -395,6 +397,51 @@ async function decodeAudio(file) {
   } finally {
     ctx.close().catch(() => {});
   }
+}
+
+// 方式2: 端末標準のレートでデコードし、OfflineAudioContextで16kHz・モノラルへ変換
+async function decodeAndResample(raw) {
+  const ctx = new AudioCtx();
+  try {
+    const buf = await ctx.decodeAudioData(raw);
+    const off = new OfflineAudioContext(1, Math.max(1, Math.ceil(buf.duration * 16000)), 16000);
+    const src = off.createBufferSource();
+    src.buffer = buf;
+    src.connect(off.destination);
+    src.start();
+    return (await off.startRendering()).getChannelData(0).slice();
+  } finally {
+    ctx.close().catch(() => {});
+  }
+}
+
+// 失敗時の診断用: ファイルの先頭と、含まれるコーデック名を調べる
+function sniffAudio(raw, file) {
+  const u = new Uint8Array(raw);
+  const head = Array.from(u.subarray(0, 16), (b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : ".")).join("");
+  const found = [];
+  for (const name of ["mp4a", "samr", "sawb", "alac", "ac-3", "ec-3", "Opus", "fLaC"]) {
+    const [a, b, c, d] = Array.from(name, (ch) => ch.charCodeAt(0));
+    for (let i = 0; i + 3 < u.length; i++) {
+      if (u[i] === a && u[i + 1] === b && u[i + 2] === c && u[i + 3] === d) { found.push(name); break; }
+    }
+  }
+  return `種類: ${file.type || "不明"} / ${(file.size / 1048576).toFixed(1)}MB / 先頭: "${head}" / コーデック: ${found.join(",") || "不明"}`;
+}
+
+async function decodeAudio(file) {
+  const raw = await file.arrayBuffer();
+  const errors = [];
+  for (const attempt of [decodeAt16k, decodeAndResample]) {
+    try {
+      return await attempt(raw.slice(0)); // decodeAudioData は渡したバッファを消費するためコピーを渡す
+    } catch (e) {
+      errors.push(`${attempt.name}: ${(e && e.name) || "Error"}: ${(e && e.message) || e}`);
+    }
+  }
+  const err = new Error(errors.join(" | "));
+  err.detail = sniffAudio(raw, file);
+  throw err;
 }
 
 function appendTranscript(text) {
@@ -411,13 +458,13 @@ function appendTranscript(text) {
   if (tx.sync && state.view === "edit" && state.currentId === n.id) tx.sync();
 }
 
-function finishTranscribe(msg) {
+function finishTranscribe(msg, toastMsg) {
   tx.running = false;
   tx.pct = null;
   tx.status = msg;
   if (tx.worker) { tx.worker.terminate(); tx.worker = null; }
   if (tx.wake) { tx.wake.release().catch(() => {}); tx.wake = null; }
-  toast(msg);
+  toast(toastMsg || msg);
   updateTxUi();
 }
 
@@ -428,7 +475,7 @@ function cancelTranscribe(msg) {
 
 async function startTranscribe(note) {
   if (!tx.file || tx.running) return;
-  if (!window.Worker || !(window.AudioContext || window.webkitAudioContext)) {
+  if (!window.Worker || !AudioCtx) {
     return toast("この端末のブラウザでは音声の文字起こしに対応していません");
   }
   tx.running = true;
@@ -443,7 +490,10 @@ async function startTranscribe(note) {
     try {
       audio = await decodeAudio(tx.file);
     } catch (e) {
-      return finishTranscribe("音声を読み込めませんでした。別の形式(m4a/mp3/wav)でお試しください");
+      return finishTranscribe(
+        `音声を読み込めませんでした。【詳細】${e.detail || ""} / ${e.message}`,
+        "音声を読み込めませんでした(詳細は画面下部)"
+      );
     }
     if (!tx.running) return; // 読み込み中に中断された
     const sec = audio.length / 16000;

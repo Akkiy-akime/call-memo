@@ -1,4 +1,4 @@
-const CACHE = "callmemo-v2";
+const CACHE = "callmemo-v3";
 const SHARE_CACHE = "callmemo-share";
 const ASSETS = [
   "./", "./index.html", "./style.css", "./app.js", "./whisper-worker.js", "./audio-utils.js", "./manifest.webmanifest",
