@@ -1,4 +1,4 @@
-const CACHE = "callmemo-v3";
+const CACHE = "callmemo-v4";
 const SHARE_CACHE = "callmemo-share";
 const ASSETS = [
   "./", "./index.html", "./style.css", "./app.js", "./whisper-worker.js", "./audio-utils.js", "./manifest.webmanifest",
@@ -6,7 +6,12 @@ const ASSETS = [
 ];
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  // ブラウザの一時保存(HTTPキャッシュ)の古いファイルを使わないよう、毎回サーバーから取得する
+  e.waitUntil(
+    caches.open(CACHE)
+      .then((c) => Promise.all(ASSETS.map((u) => c.add(new Request(u, { cache: "reload" })))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener("activate", (e) => {
@@ -17,7 +22,6 @@ self.addEventListener("activate", (e) => {
   );
 });
 
-// キャッシュ優先 + 裏で更新。共有ターゲットの ?text=... 付きURLも同じ画面として扱う。
 // 共有ターゲット(POST): 音声ファイルは一時的にキャッシュへ置き、本文は URL パラメータに載せてアプリへ渡す。
 async function handleShare(req) {
   const fd = await req.formData();
@@ -38,6 +42,7 @@ async function handleShare(req) {
   return Response.redirect(new URL("./?" + qs, self.registration.scope).href, 303);
 }
 
+// キャッシュ優先 + 裏で更新(更新確認はHTTPキャッシュを使わない)。共有ターゲットの ?text=... 付きURLも同じ画面として扱う。
 self.addEventListener("fetch", (e) => {
   const req = e.request;
   if (req.method === "POST" && req.url.split("?")[0] === self.registration.scope) {
@@ -47,11 +52,11 @@ self.addEventListener("fetch", (e) => {
   if (req.method !== "GET" || new URL(req.url).origin !== location.origin) return;
   e.respondWith(
     caches.match(req, { ignoreSearch: true }).then((cached) => {
-      const net = fetch(req).then((res) => {
-        if (res.ok) caches.open(CACHE).then((c) => c.put(req, res.clone()));
+      const fresh = fetch(new Request(req.url, { cache: "no-cache" })).then((res) => {
+        if (res.ok && !new URL(req.url).search) caches.open(CACHE).then((c) => c.put(req.url, res.clone()));
         return res;
       }).catch(() => cached);
-      return cached || net;
+      return cached || fresh;
     })
   );
 });

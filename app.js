@@ -1,5 +1,6 @@
 "use strict";
 
+const APP_VERSION = "2026-10-06.4";
 const STORE_KEY = "callmemo.v1";
 const CLAUDE_URL = "https://claude.ai/new";
 
@@ -579,6 +580,11 @@ function renderSettings(app) {
       )
     ),
     h("section", { class: "card" },
+      h("h2", null, "アプリのバージョン"),
+      h("p", { class: "hint" }, `バージョン: ${APP_VERSION}`),
+      h("p", { class: "hint" }, "更新があるときは、アプリを一度閉じて開き直すと反映されます。")
+    ),
+    h("section", { class: "card" },
       h("h2", null, "バックアップ"),
       h("p", { class: "hint" }, "データはこの端末のブラウザ内にのみ保存されます。機種変更やデータ削除に備え、定期的に書き出してください。"),
       h("div", { class: "row" },
@@ -639,4 +645,12 @@ render();
 if (incoming === "audio") loadSharedAudio();
 
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+  // 新しい版に切り替わったら自動で読み込み直す(文字起こし中は中断しないよう見送る)
+  let hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (hadController && !tx.running) location.reload();
+    hadController = true;
+  });
+}
