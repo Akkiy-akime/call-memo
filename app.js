@@ -20,7 +20,7 @@ const DEFAULT_PROMPT = `以下は顧客との電話商談の文字起こしで�
 
 const state = {
   notes: [],
-  settings: { prompt: DEFAULT_PROMPT },
+  settings: { prompt: DEFAULT_PROMPT, asrModel: "small", asrDevice: "auto" },
   view: "list",
   currentId: null,
   query: "",
@@ -34,9 +34,10 @@ function load() {
     if (!raw) return;
     const data = JSON.parse(raw);
     if (Array.isArray(data.notes)) state.notes = data.notes;
-    if (data.settings && typeof data.settings.prompt === "string") {
-      state.settings.prompt = data.settings.prompt;
-    }
+    const s = data.settings || {};
+    if (typeof s.prompt === "string") state.settings.prompt = s.prompt;
+    if (s.asrModel === "base" || s.asrModel === "small") state.settings.asrModel = s.asrModel;
+    if (["auto", "webgpu", "wasm"].includes(s.asrDevice)) state.settings.asrDevice = s.asrDevice;
   } catch (e) {
     console.warn("load failed", e);
   }
@@ -140,6 +141,7 @@ function currentNote() {
 
 function dropIfEmpty(id) {
   const n = state.notes.find((x) => x.id === id);
+  if (tx.running && tx.noteId === id) return; // 文字起こし中のメモは残す
   if (n && !n.title && !n.customer && !n.transcript && !n.summary) {
     state.notes = state.notes.filter((x) => x.id !== id);
     save();
@@ -169,7 +171,7 @@ window.addEventListener("popstate", () => { if (state.view !== "list") go("list"
 function setTopbar(title, back, actions) {
   const bar = document.getElementById("topbar");
   bar.replaceChildren(
-    back ? h("button", { onClick: back, "aria-label": "戻る" }, "← 戻る") : null,
+    ...(back ? [h("button", { onClick: back, "aria-label": "戻る" }, "← 戻る")] : []),
     h("h1", null, title),
     ...(actions || [])
   );
@@ -272,6 +274,7 @@ function renderEdit(app) {
         h("button", { class: "btn", onClick: () => copyText(note.transcript || "", "文字起こしをコピーしました") }, "コピー"),
       )
     ),
+    audioCard(note),
     h("section", { class: "card" },
       h("h2", null, "要約の方法"),
       h("div", { class: "seg" },
@@ -279,7 +282,7 @@ function renderEdit(app) {
         h("button", { class: note.mode === "external" ? "on" : "", onClick: () => setMode("external") }, "使わない(外部AIに依頼)"),
       )
     ),
-    note.mode === "external" ? externalCard : null,
+    ...(note.mode === "external" ? [externalCard] : []),
     h("section", { class: "card" },
       h("h2", null, note.mode === "external" ? "③ 要約(Claudeの回答)" : "② 要約(Recorder)"),
       summaryTa,
@@ -299,6 +302,7 @@ function renderEdit(app) {
     h("div", { class: "row" },
       h("button", { class: "btn danger", onClick: () => {
         if (confirm("このメモを削除しますか?")) {
+          if (tx.running && tx.noteId === note.id) cancelTranscribe("メモを削除したため中断しました");
           state.notes = state.notes.filter((n) => n.id !== note.id);
           save();
           go("list");
@@ -306,6 +310,189 @@ function renderEdit(app) {
       } }, "削除")
     )
   );
+
+  tx.sync = () => { transcriptTa.value = note.transcript; refreshClaude(); };
+  updateTxUi();
+}
+
+/* ---------- 音声ファイルからの文字起こし(端末内 Whisper) ---------- */
+
+const tx = {
+  file: null, worker: null, running: false, noteId: null,
+  status: "", pct: null, firstText: true, wake: null, sync: null,
+};
+
+function fmtDur(sec) {
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return m ? `${m}分${s}秒` : `${s}秒`;
+}
+
+function audioCard(note) {
+  const fileInput = h("input", {
+    type: "file", id: "tx-input", style: "display:none",
+    accept: "audio/*,.m4a,.mp3,.wav,.ogg,.amr,.3gp,.aac,.mp4",
+    onChange: (e) => { tx.file = e.target.files[0] || null; if (!tx.running) tx.status = ""; updateTxUi(); },
+  });
+  const sel = (id, key, options) => h("select", {
+    id, onChange: (e) => { state.settings[key] = e.target.value; save(); },
+  }, options.map(([v, label]) => h("option", { value: v, selected: state.settings[key] === v }, label)));
+
+  return h("section", { class: "card" },
+    h("h2", null, "音声ファイルから文字起こし(端末内)"),
+    h("p", { class: "hint" }, "電話アプリの通話録音などを選ぶと、スマホの中で日本語に文字起こしします。音声は外部に送信されません。"),
+    h("div", { class: "row" },
+      h("button", { class: "btn", id: "tx-pick", onClick: () => fileInput.click() }, "音声ファイルを選ぶ"),
+      fileInput
+    ),
+    h("p", { class: "hint", id: "tx-file" }),
+    h("label", { class: "field" }, "精度(モデル)"),
+    sel("tx-model", "asrModel", [
+      ["small", "標準(精度が高い・初回 約250〜450MB)"],
+      ["base", "軽量(速い・初回 約100〜150MB)"],
+    ]),
+    h("label", { class: "field" }, "処理方式"),
+    sel("tx-device", "asrDevice", [
+      ["auto", "自動(GPUを優先)"],
+      ["webgpu", "GPUのみ"],
+      ["wasm", "CPUのみ(遅い)"],
+    ]),
+    h("div", { class: "row" },
+      h("button", { class: "btn primary grow", id: "tx-start", onClick: () => startTranscribe(note) }, "文字起こしを開始"),
+      h("button", { class: "btn", id: "tx-cancel", onClick: () => cancelTranscribe() }, "中断"),
+    ),
+    h("progress", { id: "tx-bar", max: "100", value: "0" }),
+    h("p", { class: "hint", id: "tx-status" }),
+    h("p", { class: "hint" }, "初回はモデルのダウンロードのため、Wi-Fi接続を推奨します(2回目以降は不要)。処理中は画面を開いたままにしてください。結果は文字起こし欄の末尾に追記されます。")
+  );
+}
+
+function updateTxUi() {
+  const $ = (id) => document.getElementById(id);
+  if (!$("tx-status")) return;
+  $("tx-file").textContent = tx.file ? `選択中: ${tx.file.name}(${(tx.file.size / 1048576).toFixed(1)}MB)` : "";
+  $("tx-status").textContent = tx.status;
+  const bar = $("tx-bar");
+  bar.hidden = !tx.running;
+  if (tx.pct === null) bar.removeAttribute("value"); else bar.value = tx.pct;
+  $("tx-start").disabled = tx.running || !tx.file;
+  $("tx-cancel").hidden = !tx.running;
+  $("tx-pick").disabled = tx.running;
+  $("tx-model").disabled = tx.running;
+  $("tx-device").disabled = tx.running;
+}
+
+async function decodeAudio(file) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx({ sampleRate: 16000 });
+  try {
+    const buf = await ctx.decodeAudioData(await file.arrayBuffer());
+    const out = new Float32Array(buf.length);
+    for (let c = 0; c < buf.numberOfChannels; c++) {
+      const d = buf.getChannelData(c);
+      for (let i = 0; i < out.length; i++) out[i] += d[i] / buf.numberOfChannels;
+    }
+    return out;
+  } finally {
+    ctx.close().catch(() => {});
+  }
+}
+
+function appendTranscript(text) {
+  const n = state.notes.find((x) => x.id === tx.noteId);
+  if (!n) return;
+  if (tx.firstText) {
+    const base = (n.transcript || "").trimEnd();
+    n.transcript = base ? `${base}\n\n${text}` : text;
+    tx.firstText = false;
+  } else {
+    n.transcript += "\n" + text;
+  }
+  touch(n);
+  if (tx.sync && state.view === "edit" && state.currentId === n.id) tx.sync();
+}
+
+function finishTranscribe(msg) {
+  tx.running = false;
+  tx.pct = null;
+  tx.status = msg;
+  if (tx.worker) { tx.worker.terminate(); tx.worker = null; }
+  if (tx.wake) { tx.wake.release().catch(() => {}); tx.wake = null; }
+  toast(msg);
+  updateTxUi();
+}
+
+function cancelTranscribe(msg) {
+  if (!tx.running) return;
+  finishTranscribe(msg || "中断しました(ここまでの文字起こしは保存されています)");
+}
+
+async function startTranscribe(note) {
+  if (!tx.file || tx.running) return;
+  if (!window.Worker || !(window.AudioContext || window.webkitAudioContext)) {
+    return toast("この端末のブラウザでは音声の文字起こしに対応していません");
+  }
+  tx.running = true;
+  tx.noteId = note.id;
+  tx.firstText = true;
+  tx.pct = null;
+  tx.status = "音声を読み込み中…";
+  updateTxUi();
+  try {
+    if (navigator.wakeLock) tx.wake = await navigator.wakeLock.request("screen").catch(() => null);
+    let audio;
+    try {
+      audio = await decodeAudio(tx.file);
+    } catch (e) {
+      return finishTranscribe("音声を読み込めませんでした。別の形式(m4a/mp3/wav)でお試しください");
+    }
+    if (!tx.running) return; // 読み込み中に中断された
+    const sec = audio.length / 16000;
+    if (sec > 3600 && !confirm(`音声が長い(${fmtDur(sec)})ため、処理に長時間かかります。続けますか?`)) {
+      return finishTranscribe("中断しました");
+    }
+    tx.status = `音声(${fmtDur(sec)})を読み込みました。モデルを準備中…`;
+    updateTxUi();
+
+    const worker = new Worker("whisper-worker.js", { type: "module" });
+    tx.worker = worker;
+    worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === "status") tx.status = m.text;
+      else if (m.type === "progress" && m.phase === "load") {
+        tx.pct = m.total ? Math.round((m.loaded / m.total) * 100) : null;
+        tx.status = `モデルをダウンロード中… ${(m.loaded / 1048576).toFixed(0)} / ${(m.total / 1048576).toFixed(0)}MB`;
+      } else if (m.type === "progress") {
+        tx.pct = Math.round((m.done / m.total) * 100);
+        tx.status = `文字起こし中… ${m.done} / ${m.total}`;
+      } else if (m.type === "text") appendTranscript(m.text);
+      else if (m.type === "done") return finishTranscribe("文字起こしが完了しました");
+      else if (m.type === "error") return finishTranscribe("失敗しました: " + m.message);
+      updateTxUi();
+    };
+    worker.onerror = (e) => finishTranscribe("文字起こしエンジンの起動に失敗しました: " + (e.message || "不明なエラー"));
+    worker.postMessage(
+      { type: "start", model: state.settings.asrModel, device: state.settings.asrDevice, audio },
+      [audio.buffer]
+    );
+  } catch (e) {
+    finishTranscribe("文字起こしを開始できませんでした: " + (e && e.message ? e.message : e));
+  }
+}
+
+async function loadSharedAudio() {
+  try {
+    const cache = await caches.open("callmemo-share");
+    const res = await cache.match("shared-audio");
+    if (!res) return;
+    const blob = await res.blob();
+    const name = decodeURIComponent(res.headers.get("X-Filename") || "audio");
+    tx.file = new File([blob], name, { type: blob.type });
+    await cache.delete("shared-audio");
+    updateTxUi();
+    toast("音声を受け取りました。「文字起こしを開始」を押してください");
+  } catch (e) {
+    toast("共有された音声を取り込めませんでした");
+  }
 }
 
 async function shareToKeep(note, withTranscript) {
@@ -386,18 +573,20 @@ function handleIncomingShare() {
   const p = new URLSearchParams(location.search);
   const text = [p.get("text"), p.get("url")].filter(Boolean).join("\n").trim();
   const title = (p.get("title") || "").trim();
-  if (!text && !title) return false;
+  const hasAudio = p.get("audio") === "1";
+  if (!text && !title && !hasAudio) return false;
   const note = createNote({ title, transcript: text });
   history.replaceState(null, "", location.pathname);
   state.view = "edit";
   state.currentId = note.id;
-  toast("共有された内容を文字起こしに取り込みました");
-  return true;
+  if (!hasAudio) toast("共有された内容を文字起こしに取り込みました");
+  return hasAudio ? "audio" : true;
 }
 
 load();
-handleIncomingShare();
+const incoming = handleIncomingShare();
 render();
+if (incoming === "audio") loadSharedAudio();
 
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});

@@ -64,3 +64,9 @@ textarea[readonly] { background: var(--soft); }
 .toast.show { opacity: .95; }
 .check { display: flex; align-items: center; gap: 8px; font-size: 14px; margin-top: 10px; }
 .check input { width: 20px; height: 20px; }
+select {
+  width: 100%; font: inherit; color: var(--text); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-height: 44px;
+}
+progress { width: 100%; height: 10px; margin-top: 10px; accent-color: var(--accent); }
+.btn:disabled, select:disabled { opacity: .5; }
